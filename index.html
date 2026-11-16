@@ -644,6 +644,10 @@ header nav .sm{display:none}
 <script src="passages.js"></script>
 <script src="dict.js"></script>
 <script src="lookup.js"></script>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="supabase-config.js"></script>
+<script src="auth.js"></script>
 <script>
 const CARDS = window.CARDS;
 const ORDER = ["People & Family","School & Classroom","Home & Furniture","Kitchen & Table","Food & Drink","Body","Clothes & Accessories","Numbers, Ordinals & Clock","Time & Days","Weather & Seasons","Nature & the Outdoors","Animals & Insects","Transport & Cars","Play & Sport","Post & Mail","Travel & Immigration","Office & Business","Verbs","Verbal Nouns (Maṣdar)","Ism Fāʿil (Doers)","Adjectives","Colours","Pronouns & Pointing Words","Question Words","Prepositions & Particles","Common Phrases"];
@@ -662,9 +666,200 @@ const gTag=c=>needsG(c)?`<span class="gtag ${c.g}">${c.g==='m'?'masculine':'femi
 
 // ---- storage (per device) ----
 const KEY='arabic-flash-v1';
-let S={box:{},seen:{}}; try{S=Object.assign(S,JSON.parse(localStorage.getItem(KEY)||'{}'))}catch(e){}
-const save=()=>{try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}};
-S.r=S.r||{}; S.days=S.days||{};
+
+
+let S = {box:{}, seen:{}};
+
+try {
+  S = Object.assign(
+    S,
+    JSON.parse(localStorage.getItem(KEY) || '{}')
+  );
+} catch(e) {}
+
+let cloudSyncUserId = null;
+let cloudSyncReady = false;
+let cloudSyncBusy = false;
+let cloudSaveTimer = null;
+
+// Save locally and schedule cloud synchronisation
+const save = () => {
+  try {
+    localStorage.setItem(KEY, JSON.stringify(S));
+  } catch(e) {
+    console.error("Local save failed:", e);
+  }
+
+  if (cloudSyncReady && cloudSyncUserId) {
+    clearTimeout(cloudSaveTimer);
+
+    cloudSaveTimer = setTimeout(() => {
+      uploadProgress(cloudSyncUserId);
+    }, 1200);
+  }
+};
+
+S.r = S.r || {};
+S.days = S.days || {};
+
+// Merge local and cloud progress.
+// Cloud records take priority when the same key exists.
+function mergeProgress(local, cloud) {
+  const merged = {...cloud};
+
+  for (const [key, localValue] of Object.entries(local)) {
+    const cloudValue = cloud[key];
+
+    if (cloudValue === undefined) {
+      merged[key] = localValue;
+      continue;
+    }
+
+    if (key === 'rcDone' &&
+        Array.isArray(localValue) &&
+        Array.isArray(cloudValue)) {
+      merged[key] = [
+        ...new Set([...localValue, ...cloudValue])
+      ];
+      continue;
+    }
+
+    if (
+      localValue && cloudValue &&
+      typeof localValue === 'object' &&
+      typeof cloudValue === 'object' &&
+      !Array.isArray(localValue) &&
+      !Array.isArray(cloudValue)
+    ) {
+      merged[key] = {
+        ...localValue,
+        ...cloudValue
+      };
+
+      // Preserve the higher daily activity counts
+      if (key === 'days') {
+        for (const [day, localDay] of Object.entries(localValue)) {
+          const cloudDay = cloudValue[day];
+
+          if (cloudDay) {
+            merged[key][day] = {...localDay, ...cloudDay};
+
+            for (const field of ['n', 'ok', 'learned']) {
+              merged[key][day][field] = Math.max(
+                localDay[field] || 0,
+                cloudDay[field] || 0
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return merged;
+}
+
+// Upload progress to Supabase
+async function uploadProgress(userId) {
+  if (!userId || !cloudSyncReady || cloudSyncBusy) return;
+
+  const {error} = await window.supabaseClient
+    .from('user_data')
+    .upsert({
+      user_id: userId,
+      state: S,
+      updated_at: new Date().toISOString()
+    }, {
+      onConflict: 'user_id'
+    });
+
+  if (error) {
+    console.error("Cloud save failed:", error);
+  } else {
+    console.log("Arabic progress synchronised.");
+  }
+}
+
+// Load and synchronise progress after login
+async function syncProgress(session) {
+  if (!session) {
+    cloudSyncReady = false;
+    cloudSyncUserId = null;
+    cloudSyncBusy = false;
+    clearTimeout(cloudSaveTimer);
+    return;
+  }
+
+  const userId = session.user.id;
+
+  if (
+    cloudSyncUserId === userId &&
+    (cloudSyncReady || cloudSyncBusy)
+  ) return;
+
+  cloudSyncUserId = userId;
+  cloudSyncReady = false;
+  cloudSyncBusy = true;
+
+  try {
+    const {data, error} = await window.supabaseClient
+      .from('user_data')
+      .select('state')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (data && data.state) {
+      // Existing account: merge local and cloud progress
+      S = Object.assign(
+        S,
+        mergeProgress(S, data.state)
+      );
+
+      console.log("Existing cloud progress retrieved.");
+    } else {
+      // New cloud record: preserve guest progress
+      console.log("No cloud progress found. Uploading local progress.");
+    }
+
+    // Update local browser storage
+    localStorage.setItem(KEY, JSON.stringify(S));
+
+    // Upload merged progress
+    const {error: saveError} = await window.supabaseClient
+      .from('user_data')
+      .upsert({
+        user_id: userId,
+        state: S,
+        updated_at: new Date().toISOString()
+      }, {
+        onConflict: 'user_id'
+      });
+
+    if (saveError) throw saveError;
+
+    cloudSyncReady = true;
+
+    console.log("Cloud synchronisation ready.");
+
+  } catch(error) {
+    console.error("Progress synchronisation failed:", error);
+  } finally {
+    cloudSyncBusy = false;
+  }
+}
+
+// Listen for login and logout events
+window.addEventListener('arabic-auth-change', event => {
+  syncProgress(event.detail);
+});
+
+// Handle an existing login
+if (window.arabicSession) {
+  syncProgress(window.arabicSession);
+}
+
 const dayKey=(d=new Date())=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
 function logReview(ok){const k=dayKey(); const d=S.days[k]||(S.days[k]={n:0,ok:0,learned:0}); d.n++; if(ok)d.ok++; save();}
 function streak(){let s=0; const d=new Date(); if(!S.days[dayKey(d)]) d.setDate(d.getDate()-1); while(S.days[dayKey(d)]&&S.days[dayKey(d)].n>0){s++; d.setDate(d.getDate()-1);} return s;}
